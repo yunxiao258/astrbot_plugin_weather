@@ -1,0 +1,32 @@
+{
+  "default_city": {
+    "description": "默认城市（「/天气」无参数时优先查询），如 北京",
+    "type": "string",
+    "default": "北京"
+  },
+  "weather_push_enable": {
+    "description": "是否启用早间定时天气播报",
+    "type": "bool",
+    "default": false
+  },
+  "weather_push_time": {
+    "description": "早间播报触发时间（24 小时制 HH:MM）",
+    "type": "string",
+    "default": "07:30"
+  },
+  "weather_push_groups": {
+    "description": "播报目标群号列表，多个用英文逗号分隔，如 123456789,987654321",
+    "type": "string",
+    "default": ""
+  },
+  "weather_push_city": {
+    "description": "播报使用的城市（留空则使用 default_city）",
+    "type": "string",
+    "default": ""
+  },
+  "weather_push_platform": {
+    "description": "播报目标群所属平台标识（须与 AstrBot 平台实例 ID 一致，如 onebot/aiocqhttp）",
+    "type": "string",
+    "default": "onebot"
+  }
+}

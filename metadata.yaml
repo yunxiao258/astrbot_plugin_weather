@@ -1,0 +1,6 @@
+name: astrbot_plugin_weather
+display_name: 天气查询
+desc: 天气查询与早间播报
+help: 发送「/天气 城市名」查询实时天气；「/天气」查询默认城市或最近查询过的城市；配置 weather_push_enable 后可在每天指定时间向目标群推送早间天气播报
+version: 1.0.0
+author: Administrator
