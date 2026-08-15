@@ -468,15 +468,24 @@ class TestDirtyConfig(unittest.TestCase):
         p.config["weather_push_groups"] = ["1", 2, "3"]
         self.assertEqual(p._push_groups(), ["1", "2", "3"])
 
-    def test_push_platform_dirty(self):
+    def test_push_platform_resolve(self):
         p = make_plugin()
-        self.assertEqual(p._push_platform(), "onebot")
+        # 未配置且未学习到映射 → 空（推送会跳过并告警）
+        self.assertEqual(p._resolve_platform("123"), "")
+        self.assertEqual(p._target_umo("123"), "")
+        # 配置优先
+        p.config["weather_push_platform"] = "云晓"
+        self.assertEqual(p._resolve_platform("123"), "云晓")
+        self.assertEqual(p._target_umo("123"), "云晓:GroupMessage:123")
+        # 配置为空时使用学习映射
         p.config["weather_push_platform"] = ""
-        self.assertEqual(p._push_platform(), "onebot")
+        p._group_platforms["123"] = "凌阳"
+        self.assertEqual(p._resolve_platform("123"), "凌阳")
+        self.assertEqual(p._target_umo("123"), "凌阳:GroupMessage:123")
+        # 其他群未学习到 → 空
+        self.assertEqual(p._resolve_platform("999"), "")
         p.config["weather_push_platform"] = None
-        self.assertEqual(p._push_platform(), "onebot")
-        p.config["weather_push_platform"] = "aiocqhttp"
-        self.assertEqual(p._push_platform(), "aiocqhttp")
+        self.assertEqual(p._resolve_platform("123"), "凌阳")
 
     def test_push_enable_dirty(self):
         p = make_plugin()
@@ -498,7 +507,8 @@ class TestDirtyConfig(unittest.TestCase):
 
     def test_target_umo(self):
         p = make_plugin()
-        self.assertEqual(p._target_umo("123"), "onebot:GroupMessage:123")
+        p._group_platforms["123"] = "云晓"
+        self.assertEqual(p._target_umo("123"), "云晓:GroupMessage:123")
         p.config["weather_push_platform"] = "aiocqhttp"
         self.assertEqual(p._target_umo("123"), "aiocqhttp:GroupMessage:123")
 

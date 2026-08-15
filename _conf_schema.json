@@ -25,8 +25,8 @@
     "default": ""
   },
   "weather_push_platform": {
-    "description": "播报目标群所属平台标识（须与 AstrBot 平台实例 ID 一致，如 onebot/aiocqhttp）",
+    "description": "播报目标群所属平台实例 ID（如 云晓）。可留空：插件会自动学习目标群的平台（该群使用过 /天气 后生效）",
     "type": "string",
-    "default": "onebot"
+    "default": ""
   }
 }
