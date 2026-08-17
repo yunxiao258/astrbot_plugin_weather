@@ -28,13 +28,16 @@ DEFAULT_PUSH_TIME = "07:30"
 
 # 天气数据源：优先国内可访问的 wttr.in 免费 JSON 接口（支持中文城市名），
 # 按顺序逐个尝试，全部失败返回 None（降级不影响插件运行）。
+# 仅使用 HTTPS 源，避免明文 HTTP 中间人篡改。
 WEATHER_SOURCES = [
     "https://wttr.in/{city}?format=j1&lang=zh",
-    "http://wttr.in/{city}?format=j1&lang=zh",
 ]
 
 # 请求 UA，部分网络环境需要伪装浏览器
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
+# 天气响应体大小上限（防止异常源导致内存膨胀）
+MAX_BODY_BYTES = 2 * 1024 * 1024
 
 
 @register(PLUGIN_NAME, PLUGIN_AUTHOR, PLUGIN_DESC, PLUGIN_VERSION)
@@ -264,8 +267,10 @@ class WeatherPlugin(Star):
                 url = template.format(city=urllib.parse.quote(city))
                 req = urllib.request.Request(url, headers={"User-Agent": _UA})
                 with urllib.request.urlopen(req, timeout=10) as resp:
-                    raw = resp.read().decode("utf-8", errors="ignore")
-                data = json.loads(raw)
+                    raw = resp.read(MAX_BODY_BYTES + 1)
+                if len(raw) > MAX_BODY_BYTES:
+                    raise ValueError(f"响应体过大（>{MAX_BODY_BYTES} 字节）")
+                data = json.loads(raw.decode("utf-8", errors="ignore"))
                 parsed = self._parse_weather_data(city, data)
                 if parsed:
                     return parsed
@@ -386,12 +391,14 @@ class WeatherPlugin(Star):
 
     # ========== 发送 ==========
 
-    async def _send_text_to(self, umo: str, text: str):
-        """向指定 UMO 会话推送纯文本（失败仅告警）"""
+    async def _send_text_to(self, umo: str, text: str) -> bool:
+        """向指定 UMO 会话推送纯文本；成功返回 True，失败告警并返回 False（调用方不记账）"""
         try:
             await self.context.send_message(umo, MessageChain([Plain(text)]))
+            return True
         except Exception as e:
             logger.warning(f"【{PLUGIN_NAME}】推送天气到 {umo} 失败: {e}")
+            return False
 
     def _send_text(self, event: AstrMessageEvent, text: str):
         """构造命令回复的纯文本结果"""
@@ -399,15 +406,26 @@ class WeatherPlugin(Star):
 
     # ========== 定时播报 ==========
 
+    async def initialize(self) -> None:
+        """插件加载/重载时启动定时播报任务"""
+        await self._start_push_loop()
+
     @filter.on_astrbot_loaded()
     async def _start_push_loop(self):
-        """AstrBot 加载完成后启动定时播报任务（仅在启用且未运行时）"""
+        """启动定时播报任务（幂等：重复调用不会重复启动）"""
         if not self._push_enabled():
             return
         if self._running:
             return
         self._running = True
         self._task = asyncio.create_task(self._push_loop())
+        self._task.add_done_callback(
+            lambda t: (
+                logger.error(f"定时播报任务异常退出: {t.exception()}")
+                if not t.cancelled() and t.exception()
+                else None
+            )
+        )
         logger.info(f"【{PLUGIN_NAME}】定时播报已启动，每日 {self._push_time()} 推送")
 
     async def _push_loop(self):
@@ -438,8 +456,8 @@ class WeatherPlugin(Star):
         if not city:
             logger.warning(f"【{PLUGIN_NAME}】未配置播报城市，本次跳过推送")
             return
-        # 抓取失败返回 None 则本次不推送（降级，不影响插件运行）
-        weather = self._fetch_weather(city)
+        # 抓取失败返回 None 则本次不推送（降级，不影响插件运行）；同步网络请求放入线程池避免阻塞事件循环
+        weather = await asyncio.to_thread(self._fetch_weather, city)
         if not weather:
             logger.warning(f"【{PLUGIN_NAME}】{today} 天气抓取失败，本次跳过推送")
             return
@@ -454,8 +472,8 @@ class WeatherPlugin(Star):
                     f"（可在 weather_push_platform 中指定，或先在该群使用一次 /天气），本次跳过推送"
                 )
                 continue
-            await self._send_text_to(umo, text)
-            self._mark_pushed(today, group)
+            if await self._send_text_to(umo, text):
+                self._mark_pushed(today, group)
 
     # ========== 指令处理 ==========
 
@@ -478,7 +496,7 @@ class WeatherPlugin(Star):
                 city = self._default_city() or self._recent_city(str(event.session))
             if not city:
                 return self._send_text(event, "❌ 未设置默认城市，请发送「/天气 城市名」查询，或在插件配置中设置 default_city")
-            weather = self._fetch_weather(city)
+            weather = await asyncio.to_thread(self._fetch_weather, city)
             if not weather:
                 return self._send_text(event, f"❌ 获取「{city}」天气失败，请检查城市名是否正确或稍后重试")
             # 查询成功后记录最近城市（按会话）并持久化
