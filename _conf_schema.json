@@ -28,5 +28,15 @@
     "description": "播报目标群所属平台实例 ID（如 云晓）。可留空：插件会自动学习目标群的平台（该群使用过 /天气 后生效）",
     "type": "string",
     "default": ""
+  },
+  "weather_forecast_days": {
+    "description": "「/天气 预报」展示天数（1~7，数据源最多支持 3 天），非法值回退默认 3",
+    "type": "int",
+    "default": 3
+  },
+  "weather_alert_enabled": {
+    "description": "是否在预报/指数结果中附加规则化天气提醒（高温/低温/大风/降雨等）",
+    "type": "bool",
+    "default": true
   }
 }

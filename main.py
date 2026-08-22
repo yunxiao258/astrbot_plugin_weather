@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""AstrBot 天气查询插件：/天气 城市 实时天气查询 + 早间定时播报"""
+"""AstrBot 天气查询插件：/天气 城市 实时天气 + 多日预报 + 生活指数 + 早间定时播报"""
 
 import asyncio
 import json
@@ -18,13 +18,16 @@ from astrbot.api.star import Context, Star, register
 # 插件元数据
 PLUGIN_NAME = "astrbot_plugin_weather"
 PLUGIN_AUTHOR = "云晓"
-PLUGIN_DESC = "天气查询与早间播报"
-PLUGIN_VERSION = "1.0.0"
+PLUGIN_DESC = "天气查询：实时天气/多日预报/生活指数/天气提醒与早间播报"
+PLUGIN_VERSION = "1.1.0"
 
 # 后台定时检查间隔（秒）
 PUSH_CHECK_INTERVAL = 30
 # 早间播报默认时间
 DEFAULT_PUSH_TIME = "07:30"
+
+# 多日预报默认天数（wttr.in 免费源最多返回 3 天）
+DEFAULT_FORECAST_DAYS = 3
 
 # 天气数据源：优先国内可访问的 wttr.in 免费 JSON 接口（支持中文城市名），
 # 按顺序逐个尝试，全部失败返回 None（降级不影响插件运行）。
@@ -250,14 +253,10 @@ class WeatherPlugin(Star):
 
     # ========== 天气抓取（可替换的数据源抽象） ==========
 
-    def _fetch_weather(self, city: str) -> dict | None:
-        """获取指定城市实时天气，失败返回 None。
+    def _fetch_raw(self, city: str):
+        """获取指定城市天气源原始 JSON（轮询各数据源），全部失败返回 None。
 
-        依次尝试各天气数据源（优先国内可访问的 wttr.in 免费 JSON 接口），
-        成功解析后返回统一结构:
-            {"city", "date", "text", "temp_min", "temp_max", "humidity", "wind"}
-        全部数据源失败或解析失败返回 None（调用方降级提示，不影响插件运行）。
-        测试时应 mock 本方法，不实际联网。
+        测试时应 mock 本方法或 _fetch_weather，不实际联网。
         """
         city = str(city or "").strip()
         if not city:
@@ -270,15 +269,41 @@ class WeatherPlugin(Star):
                     raw = resp.read(MAX_BODY_BYTES + 1)
                 if len(raw) > MAX_BODY_BYTES:
                     raise ValueError(f"响应体过大（>{MAX_BODY_BYTES} 字节）")
-                data = json.loads(raw.decode("utf-8", errors="ignore"))
-                parsed = self._parse_weather_data(city, data)
-                if parsed:
-                    return parsed
+                return json.loads(raw.decode("utf-8", errors="ignore"))
             except Exception as e:
                 # 单个数据源失败仅告警，继续尝试下一源
                 logger.warning(f"【{PLUGIN_NAME}】天气源 {template} 请求失败: {e}")
                 continue
         return None
+
+    def _forecast_days(self) -> int:
+        """多日预报天数（1~7），脏值回退默认 3"""
+        v = self._safe_int(self.config.get("weather_forecast_days"), DEFAULT_FORECAST_DAYS)
+        if v is None:
+            return DEFAULT_FORECAST_DAYS
+        return min(7, max(1, v))
+
+    def _alert_enabled(self) -> bool:
+        """天气提醒开关（脏值防御），默认开启"""
+        return self._safe_bool(self.config.get("weather_alert_enabled"), True)
+
+    def _fetch_weather(self, city: str) -> dict | None:
+        """获取指定城市实时天气，失败返回 None。
+
+        依次尝试各天气数据源（优先国内可访问的 wttr.in 免费 JSON 接口），
+        成功解析后返回统一结构:
+            {"city", "date", "text", "temp_min", "temp_max", "humidity", "wind",
+             "uv", "rain_chance"}
+        全部数据源失败或解析失败返回 None（调用方降级提示，不影响插件运行）。
+        测试时应 mock 本方法，不实际联网。
+        """
+        city = str(city or "").strip()
+        if not city:
+            return None
+        data = self._fetch_raw(city)
+        if data is None:
+            return None
+        return self._parse_weather_data(city, data)
 
     def _parse_weather_data(self, city: str, data) -> dict | None:
         """解析天气源 JSON（wttr.in j1 格式）为统一天气结构（脏值防御）"""
@@ -318,6 +343,20 @@ class WeatherPlugin(Star):
                 wind_parts.append(dir_)
             if speed is not None:
                 wind_parts.append(f"{speed}km/h")
+            # 紫外线指数（当前时段）
+            uv = self._safe_int(cur.get("uvIndex"))
+            # 当天降雨概率（取各时段最大值）
+            rain_chance = None
+            hourly = today.get("hourly") or []
+            chances = []
+            if isinstance(hourly, list):
+                for h in hourly:
+                    if isinstance(h, dict):
+                        c = self._safe_int(h.get("chanceofrain"))
+                        if c is not None:
+                            chances.append(c)
+                if chances:
+                    rain_chance = max(chances)
             return {
                 "city": city or "未知城市",
                 "date": str(today.get("date") or "").strip() or self._now().strftime("%Y-%m-%d"),
@@ -326,6 +365,8 @@ class WeatherPlugin(Star):
                 "temp_max": temp_max,
                 "humidity": humidity,
                 "wind": " ".join(wind_parts),
+                "uv": uv,
+                "rain_chance": rain_chance,
             }
         except Exception as e:
             logger.warning(f"【{PLUGIN_NAME}】解析天气数据失败: {e}")
@@ -388,6 +429,197 @@ class WeatherPlugin(Star):
             lines.append(f"🍃 风力: {wind}")
         lines.append(f"👕 {self._advice(text, tmin, tmax)}")
         return "\n".join(lines)
+
+    # ========== 多日预报（v1.1.0） ==========
+
+    def _parse_forecast_data(self, city: str, data) -> list[dict]:
+        """解析天气源 JSON 为多日预报列表（wttr.in j1 格式 weather 数组）。
+
+        每天返回统一结构:
+            {"date", "label", "text", "temp_min", "temp_max", "rain_chance"}
+        数据异常时尽力解析，全部失败返回空列表。
+        """
+        try:
+            if not isinstance(data, dict):
+                return []
+            weather_list = data.get("weather") or []
+            if not isinstance(weather_list, list):
+                return []
+            limit = self._forecast_days()
+            days = []
+            for i, day in enumerate(weather_list[:limit]):
+                if not isinstance(day, dict):
+                    continue
+                date = str(day.get("date") or "").strip()
+                tmin = self._safe_int(day.get("mintempC"))
+                tmax = self._safe_int(day.get("maxtempC"))
+                # 天气现象取正午时段描述，回退第一个时段
+                hourly = day.get("hourly") or []
+                text = ""
+                rain_chance = None
+                chances = []
+                if isinstance(hourly, list) and hourly:
+                    pick = hourly[len(hourly) // 2] if len(hourly) >= 3 else hourly[0]
+                    if isinstance(pick, dict):
+                        desc = pick.get("weatherDesc") or []
+                        if isinstance(desc, list) and desc and isinstance(desc[0], dict):
+                            text = str(desc[0].get("value") or "").strip()
+                    for h in hourly:
+                        if isinstance(h, dict):
+                            c = self._safe_int(h.get("chanceofrain"))
+                            if c is not None:
+                                chances.append(c)
+                if chances:
+                    rain_chance = max(chances)
+                label = ["今天", "明天", "后天"][i] if i < 3 else date
+                days.append({
+                    "date": date,
+                    "label": label,
+                    "text": text or "未知",
+                    "temp_min": tmin,
+                    "temp_max": tmax,
+                    "rain_chance": rain_chance,
+                })
+            return [d for d in days if d["date"]]
+        except Exception as e:
+            logger.warning(f"【{PLUGIN_NAME}】解析多日预报失败: {e}")
+            return []
+
+    def _fetch_forecast(self, city: str) -> list[dict]:
+        """抓取并解析多日预报，失败返回空列表。测试时应 mock 本方法。"""
+        city = str(city or "").strip()
+        if not city:
+            return []
+        data = self._fetch_raw(city)
+        if data is None:
+            return []
+        return self._parse_forecast_data(city, data)
+
+    def _format_forecast(self, city: str, days: list[dict]) -> str:
+        """把多日预报格式化为播报文本（含天气提醒段落）"""
+        lines = [
+            f"🌤️ {city} 未来 {len(days)} 天预报",
+            "━━━━━━━━━━━━━━━━━━━━━━",
+        ]
+        for d in days:
+            tmin, tmax = d.get("temp_min"), d.get("temp_max")
+            if isinstance(tmin, (int, float)) and isinstance(tmax, (int, float)):
+                temp = f"{int(tmin)}°C ~ {int(tmax)}°C"
+            elif isinstance(tmax, (int, float)):
+                temp = f"{int(tmax)}°C"
+            else:
+                temp = "未知"
+            line = f"{d['label']}: {d['text']} · {temp}"
+            rc = d.get("rain_chance")
+            if isinstance(rc, (int, float)):
+                line += f" · 降雨概率 {int(rc)}%"
+            lines.append(line)
+        alerts = []
+        if days and self._alert_enabled():
+            alerts = self._weather_alerts(days[0])
+        if alerts:
+            lines.append("⚠️ 天气提醒")
+            for a in alerts:
+                lines.append(f"  {a}")
+        return "\n".join(lines)
+
+    # ========== 生活指数与天气提醒（v1.1.0） ==========
+
+    def _life_indices(self, weather: dict) -> list[tuple[str, str]]:
+        """根据天气数据生成生活指数列表 [(名称, 说明), ...]
+
+        包含穿衣 / 洗车 / 紫外线 / 运动四项；数据缺失项给出兜底文案。
+        """
+        text = str(weather.get("text") or "")
+        tmin = weather.get("temp_min")
+        tmax = weather.get("temp_max")
+        temps = [t for t in (tmin, tmax) if isinstance(t, (int, float))]
+        avg = sum(temps) / len(temps) if temps else None
+        wet = any(k in text for k in ("雨", "雪"))
+        # 穿衣
+        clothing = self._advice(text, tmin, tmax)
+        # 洗车
+        rc = weather.get("rain_chance")
+        if wet or (isinstance(rc, (int, float)) and rc >= 50):
+            carwash = "不宜洗车：近期有雨雪，洗后易脏"
+        else:
+            carwash = "适宜洗车"
+        # 紫外线
+        uv = weather.get("uv")
+        if isinstance(uv, (int, float)):
+            v = float(uv)
+            if v <= 2:
+                uv_desc = f"{int(v)} 级（弱），外出无需特别防护"
+            elif v <= 5:
+                uv_desc = f"{int(v)} 级（中等），外出建议涂抹防晒霜"
+            elif v <= 7:
+                uv_desc = f"{int(v)} 级（强），注意防晒，建议戴帽子或打遮阳伞"
+            elif v <= 10:
+                uv_desc = f"{int(v)} 级（很强），避免午间长时间外出，务必防晒"
+            else:
+                uv_desc = f"{int(v)} 级（极强），尽量减少外出，做好全面防护"
+        else:
+            uv_desc = "暂无数据"
+        # 运动
+        bad_sport = any(k in text for k in ("雨", "雪", "雷", "雾", "沙尘"))
+        if avg is None:
+            sport = "温度数据缺失，请根据体感安排运动"
+        elif avg > 35 or avg < -10:
+            sport = "气温极端，不建议户外运动，注意防护"
+        elif bad_sport:
+            sport = "天气不佳，建议改为室内运动"
+        else:
+            sport = "适宜户外运动，运动前后注意补水"
+        return [
+            ("穿衣", clothing),
+            ("洗车", carwash),
+            ("紫外线", uv_desc),
+            ("运动", sport),
+        ]
+
+    def _format_indices(self, weather: dict) -> str:
+        """把生活指数格式化为播报文本（含天气提醒段落）"""
+        city = str(weather.get("city") or "未知城市")
+        date = str(weather.get("date") or "").strip() or self._now().strftime("%Y-%m-%d")
+        lines = [
+            f"🧭 {city} 生活指数",
+            "━━━━━━━━━━━━━━━━━━━━━━",
+            f"📅 日期: {date}",
+        ]
+        for name, desc in self._life_indices(weather):
+            icon = {"穿衣": "👕", "洗车": "🚿", "紫外线": "🔆", "运动": "🏃"}.get(name, "•")
+            lines.append(f"{icon} {name}: {desc}")
+        alerts = self._weather_alerts(weather)
+        if alerts:
+            lines.append("⚠️ 天气提醒")
+            for a in alerts:
+                lines.append(f"  {a}")
+        return "\n".join(lines)
+
+    def _weather_alerts(self, day: dict) -> list[str]:
+        """基于单日数据的规则化天气提醒（非官方气象预警）；开关关闭或数据为空返回空列表"""
+        if not day or not self._alert_enabled():
+            return []
+        alerts = []
+        text = str(day.get("text") or "")
+        tmax = day.get("temp_max")
+        tmin = day.get("temp_min")
+        rc = day.get("rain_chance")
+        m = re.search(r"(\d+)\s*km/h", str(day.get("wind") or ""))
+        speed = int(m.group(1)) if m else None
+        if isinstance(tmax, (int, float)) and tmax >= 35:
+            alerts.append(f"高温提醒：最高温将达 {int(tmax)}°C，注意防暑降温、及时补水")
+        if isinstance(tmin, (int, float)) and tmin <= 0:
+            alerts.append(f"低温提醒：最低温降至 {int(tmin)}°C，注意防寒保暖")
+        if speed is not None and speed >= 40:
+            alerts.append(f"大风提醒：风速约 {speed}km/h，外出远离广告牌等高处悬挂物")
+        if any(k in text for k in ("雷", "暴雨")):
+            alerts.append("强对流提醒：有雷暴或强降雨，请减少外出、远离积水与大树")
+        elif "雾" in text:
+            alerts.append("大雾提醒：能见度较低，驾车请减速慢行")
+        if not any(k in text for k in ("雨", "雷")) and isinstance(rc, (int, float)) and rc >= 80:
+            alerts.append(f"降雨提醒：降雨概率约 {int(rc)}%，出门请携带雨具")
+        return alerts
 
     # ========== 发送 ==========
 
@@ -479,7 +711,7 @@ class WeatherPlugin(Star):
 
     @filter.command("天气")
     async def weather_cmd(self, event: AstrMessageEvent):
-        """/天气 城市名 查询实时天气；/天气 查询默认城市或最近查询过的城市"""
+        """/天气 [城市] 实时天气；/天气 预报 [城市] 多日预报；/天气 指数 [城市] 生活指数"""
         try:
             self._learn_platform(event)
             raw = event.message_str.strip()
@@ -487,24 +719,58 @@ class WeatherPlugin(Star):
                 raw = raw[1:]
             city = ""
             m = re.match(r"^天气\s*(.*)$", raw, re.S)
-            if m:
-                city = (m.group(1) or "").strip()
+            rest = (m.group(1) or "").strip() if m else ""
+            # 子命令识别：预报/未来 → 多日预报；指数 → 生活指数
+            sub = ""
+            for kw in ("预报", "未来", "指数"):
+                if rest.startswith(kw):
+                    sub = kw
+                    rest = rest[len(kw):].strip()
+                    break
+            city = rest.split()[0] if rest.split() else rest
             # 城市参数取第一段（/天气 北京 上海 只查询第一个）
-            if city:
-                city = city.split()[0] if city.split() else city
             if not city:
                 city = self._default_city() or self._recent_city(str(event.session))
             if not city:
-                return self._send_text(event, "❌ 未设置默认城市，请发送「/天气 城市名」查询，或在插件配置中设置 default_city")
-            weather = await asyncio.to_thread(self._fetch_weather, city)
-            if not weather:
-                return self._send_text(event, f"❌ 获取「{city}」天气失败，请检查城市名是否正确或稍后重试")
-            # 查询成功后记录最近城市（按会话）并持久化
-            self._remember_city(str(event.session), weather.get("city") or city)
-            return self._send_text(event, self._format_weather(weather))
+                return self._send_text(
+                    event,
+                    "❌ 未设置默认城市，请发送「/天气 城市名」查询，或在插件配置中设置 default_city",
+                )
+            display_city = city
+            if sub == "指数":
+                return await self._cmd_indices(event, display_city)
+            if sub in ("预报", "未来"):
+                return await self._cmd_forecast(event, display_city)
+            return await self._cmd_current(event, display_city)
         except Exception as e:
             logger.error(f"【{PLUGIN_NAME}】天气查询异常: {e}")
             return self._send_text(event, f"❌ 查询天气失败: {str(e)}")
+
+    async def _cmd_current(self, event: AstrMessageEvent, city: str):
+        """实时天气查询"""
+        weather = await asyncio.to_thread(self._fetch_weather, city)
+        if not weather:
+            return self._send_text(event, f"❌ 获取「{city}」天气失败，请检查城市名是否正确或稍后重试")
+        # 查询成功后记录最近城市（按会话）并持久化
+        self._remember_city(str(event.session), weather.get("city") or city)
+        return self._send_text(event, self._format_weather(weather))
+
+    async def _cmd_forecast(self, event: AstrMessageEvent, city: str):
+        """多日预报查询（默认 3 天，可配置 1~7 天）"""
+        days = await asyncio.to_thread(self._fetch_forecast, city)
+        if not days:
+            return self._send_text(event, f"❌ 获取「{city}」多日预报失败，请检查城市名是否正确或稍后重试")
+        # 预报成功同样记忆最近城市
+        self._remember_city(str(event.session), city)
+        return self._send_text(event, self._format_forecast(city, days))
+
+    async def _cmd_indices(self, event: AstrMessageEvent, city: str):
+        """生活指数查询（穿衣/洗车/紫外线/运动 + 天气提醒）"""
+        weather = await asyncio.to_thread(self._fetch_weather, city)
+        if not weather:
+            return self._send_text(event, f"❌ 获取「{city}」天气失败，无法生成生活指数，请稍后重试")
+        self._remember_city(str(event.session), weather.get("city") or city)
+        return self._send_text(event, self._format_indices(weather))
 
     # ========== 生命周期 ==========
 
