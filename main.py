@@ -19,7 +19,7 @@ from astrbot.api.star import Context, Star, register
 PLUGIN_NAME = "astrbot_plugin_weather"
 PLUGIN_AUTHOR = "云晓"
 PLUGIN_DESC = "天气查询：实时天气/多日预报/生活指数/天气提醒与早间播报"
-PLUGIN_VERSION = "1.1.0"
+PLUGIN_VERSION = "1.1.1"
 
 # 后台定时检查间隔（秒）
 PUSH_CHECK_INTERVAL = 30
@@ -642,12 +642,15 @@ class WeatherPlugin(Star):
         """插件加载/重载时启动定时播报任务"""
         await self._start_push_loop()
 
-    @filter.on_astrbot_loaded()
     async def _start_push_loop(self):
         """启动定时播报任务（幂等：重复调用不会重复启动）"""
         if not self._push_enabled():
             return
         if self._running:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
             return
         self._running = True
         self._task = asyncio.create_task(self._push_loop())

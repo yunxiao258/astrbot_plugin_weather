@@ -5,12 +5,13 @@
 不联网、不写真实 plugin_data。
 """
 import asyncio
+import os
 import sys
 import tempfile
 import unittest
 from datetime import datetime
 
-sys.path.insert(0, r"D:\astrbot\data\plugins")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from astrbot_plugin_weather.main import WeatherPlugin  # noqa: E402
 
