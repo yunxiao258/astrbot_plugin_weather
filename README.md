@@ -79,3 +79,8 @@
 ```bash
 D:\uv-tools\astrbot\Scripts\python.exe test_weather.py
 ```
+
+## 更新记录
+
+### v1.2.0
+- 接入插件生态中枢标准联动协议（`hub_status` / `hub_action` 与早间播报/天气预警事件上报）

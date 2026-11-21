@@ -19,7 +19,12 @@ from astrbot.api.star import Context, Star, register
 PLUGIN_NAME = "astrbot_plugin_weather"
 PLUGIN_AUTHOR = "云晓"
 PLUGIN_DESC = "天气查询：实时天气/多日预报/生活指数/天气提醒与早间播报"
-PLUGIN_VERSION = "1.1.1"
+try:
+    from .hub_bridge import HUB_PROTOCOL_VERSION, emit_hub_event
+except ImportError:
+    from hub_bridge import HUB_PROTOCOL_VERSION, emit_hub_event
+
+PLUGIN_VERSION = "1.2.0"
 
 # 后台定时检查间隔（秒）
 PUSH_CHECK_INTERVAL = 30
@@ -45,6 +50,7 @@ MAX_BODY_BYTES = 2 * 1024 * 1024
 
 @register(PLUGIN_NAME, PLUGIN_AUTHOR, PLUGIN_DESC, PLUGIN_VERSION)
 class WeatherPlugin(Star):
+    HUB_PROTOCOL_VERSION = HUB_PROTOCOL_VERSION
     """天气查询与早间播报：/天气 城市名 查询；定时向目标群推送当天天气"""
 
     def __init__(self, context: Context, config: AstrBotConfig = None):
@@ -709,6 +715,9 @@ class WeatherPlugin(Star):
                 continue
             if await self._send_text_to(umo, text):
                 self._mark_pushed(today, group)
+                alerts = self._weather_alerts(weather) if hasattr(self, "_weather_alerts") else []
+                ev_name = "weather.alert" if alerts else "weather.pushed"
+                emit_hub_event(PLUGIN_NAME, ev_name, {"umo": umo, "group_id": group, "city": city, "alerts": alerts, "summary": text[:280]}, self.context)
 
     # ========== 指令处理 ==========
 
@@ -787,3 +796,23 @@ class WeatherPlugin(Star):
             except asyncio.CancelledError:
                 pass
             self._task = None
+
+    def hub_status(self) -> dict:
+        return {
+            "version": PLUGIN_VERSION,
+            "status": "online",
+            "metrics": {"默认城市": self._default_city() or "未设", "早间播报": "开" if self._push_enabled() else "关", "目标群": len(self._push_groups())},
+            "actions": ["get_status", "query_city"],
+        }
+
+    async def hub_action(self, action: str, params: dict | None = None) -> dict:
+        p = params or {}
+        if action == "get_status":
+            return {"ok": True, "data": {"default_city": self._default_city(), "push_enabled": self._push_enabled(), "push_time": self._push_time(), "push_groups": self._push_groups()}}
+        if action == "query_city":
+            city = str(p.get("city") or self._default_city() or "北京").strip()
+            w = await asyncio.to_thread(self._fetch_weather, city)
+            if not w:
+                return {"ok": False, "error": f"获取 {city} 天气失败"}
+            return {"ok": True, "data": {"city": city, "text": self._format_weather(w)}}
+        return {"ok": False, "error": f"不支持的动作：{action}"}
